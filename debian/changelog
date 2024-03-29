@@ -1,3 +1,9 @@
+cosmic-comp (0.1ubuntu2) noble; urgency=medium
+
+  * Resync with master
+
+ -- Aaron Honeycutt <aaron@system76.com>  Fri, 29 Mar 2024 11:09:07 -0600
+
 cosmic-comp (0.1ubuntu1) noble; urgency=medium
 
   * Update to noble
