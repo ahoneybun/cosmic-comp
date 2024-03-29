@@ -5,7 +5,10 @@ use crate::{
     config::{xkb_config_to_wl, Action, Config, KeyModifiers, KeyPattern},
     input::gestures::{GestureState, SwipeAction},
     shell::{
-        focus::{target::PointerFocusTarget, FocusDirection},
+        focus::{
+            target::{KeyboardFocusTarget, PointerFocusTarget},
+            FocusDirection,
+        },
         grabs::{ResizeEdge, SeatMenuGrabState, SeatMoveGrabState},
         layout::{
             floating::ResizeGrabMarker,
@@ -17,14 +20,13 @@ use crate::{
     state::Common,
     utils::prelude::*,
     wayland::{
-        handlers::{screencopy::ScreencopySessions, xdg_activation::ActivationContext},
-        protocols::screencopy::Session,
+        handlers::{screencopy::SessionHolder, xdg_activation::ActivationContext},
+        protocols::screencopy::{BufferConstraints, CursorSession},
     },
 };
 use calloop::{timer::Timer, RegistrationToken};
 use cosmic_comp_config::{workspace::WorkspaceLayout, TileBehavior};
 use cosmic_config::ConfigSet;
-use cosmic_protocols::screencopy::v1::server::zcosmic_screencopy_session_v1::InputType;
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, Device, DeviceCapability, GestureBeginEvent,
@@ -33,7 +35,10 @@ use smithay::{
         TabletToolEvent, TabletToolProximityEvent, TabletToolTipEvent, TabletToolTipState,
         TouchEvent,
     },
-    desktop::{layer_map_for_output, space::SpaceElement, WindowSurfaceType},
+    desktop::{
+        layer_map_for_output, space::SpaceElement, utils::under_from_surface_tree,
+        WindowSurfaceType,
+    },
     input::{
         keyboard::{FilterResult, KeysymHandle, LedState, XkbConfig},
         pointer::{
@@ -42,10 +47,14 @@ use smithay::{
             GestureSwipeBeginEvent, GestureSwipeEndEvent, GestureSwipeUpdateEvent, MotionEvent,
             RelativeMotionEvent,
         },
+        touch::{DownEvent, MotionEvent as TouchMotionEvent, UpEvent},
         Seat, SeatState,
     },
     output::Output,
-    reexports::{input::Device as InputDevice, wayland_server::DisplayHandle},
+    reexports::{
+        input::Device as InputDevice,
+        wayland_server::{protocol::wl_shm::Format as ShmFormat, DisplayHandle},
+    },
     utils::{Point, Serial, SERIAL_COUNTER},
     wayland::{
         keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat,
@@ -54,6 +63,7 @@ use smithay::{
         shell::wlr_layer::Layer as WlrLayer,
         tablet_manager::{TabletDescriptor, TabletSeatTrait},
     },
+    xwayland::X11Surface,
 };
 #[cfg(not(feature = "debug"))]
 use tracing::info;
@@ -723,11 +733,15 @@ impl State {
                                 ptr.frame(self);
                                 return;
                             }
-                            if let PointerFocusTarget::Element(element) = surface {
-                                //if !element.is_in_input_region(&(position.to_i32_round() - *surface_loc).to_f64()) {
-                                if !element.is_in_input_region(
-                                    &(position.as_logical() - surface_loc.to_f64()),
-                                ) {
+                            if let PointerFocusTarget::WlSurface { surface, .. } = surface {
+                                if under_from_surface_tree(
+                                    surface,
+                                    position.as_logical() - surface_loc.to_f64(),
+                                    (0, 0),
+                                    WindowSurfaceType::ALL,
+                                )
+                                .is_some()
+                                {
                                     ptr.frame(self);
                                     return;
                                 }
@@ -776,18 +790,13 @@ impl State {
                     }
 
                     if output != current_output {
-                        for session in sessions_for_output(&self.common, &current_output) {
-                            session.cursor_leave(&seat, InputType::Pointer);
+                        for session in cursor_sessions_for_output(&self.common, &current_output) {
+                            session.set_cursor_pos(None);
                         }
-
-                        for session in sessions_for_output(&self.common, &output) {
-                            session.cursor_enter(&seat, InputType::Pointer);
-                        }
-
                         seat.set_active_output(&output);
                     }
 
-                    for session in sessions_for_output(&self.common, &output) {
+                    for session in cursor_sessions_for_output(&self.common, &output) {
                         if let Some((geometry, offset)) = seat.cursor_geometry(
                             position.as_logical().to_buffer(
                                 output.current_scale().fractional_scale(),
@@ -796,7 +805,19 @@ impl State {
                             ),
                             self.common.clock.now(),
                         ) {
-                            session.cursor_info(&seat, InputType::Pointer, geometry, offset);
+                            if session
+                                .current_constraints()
+                                .map(|constraint| constraint.size != geometry.size)
+                                .unwrap_or(true)
+                            {
+                                session.update_constraints(BufferConstraints {
+                                    size: geometry.size,
+                                    shm: vec![ShmFormat::Argb8888],
+                                    dma: None,
+                                });
+                            }
+                            session.set_cursor_hotspot(offset);
+                            session.set_cursor_pos(Some(geometry.loc));
                         }
                     }
                     #[cfg(feature = "debug")]
@@ -822,7 +843,7 @@ impl State {
                     let under = State::surface_under(position, &output, &mut self.common.shell)
                         .map(|(target, pos)| (target, pos.as_logical()));
 
-                    for session in sessions_for_output(&self.common, &output) {
+                    for session in cursor_sessions_for_output(&self.common, &output) {
                         if let Some((geometry, offset)) = seat.cursor_geometry(
                             position.as_logical().to_buffer(
                                 output.current_scale().fractional_scale(),
@@ -831,7 +852,19 @@ impl State {
                             ),
                             self.common.clock.now(),
                         ) {
-                            session.cursor_info(&seat, InputType::Pointer, geometry, offset);
+                            if session
+                                .current_constraints()
+                                .map(|constraint| constraint.size != geometry.size)
+                                .unwrap_or(true)
+                            {
+                                session.update_constraints(BufferConstraints {
+                                    size: geometry.size,
+                                    shm: vec![ShmFormat::Argb8888],
+                                    dma: None,
+                                });
+                            }
+                            session.set_cursor_hotspot(offset);
+                            session.set_cursor_pos(Some(geometry.loc));
                         }
                     }
                     let ptr = seat.get_pointer().unwrap();
@@ -876,18 +909,16 @@ impl State {
                     let serial = SERIAL_COUNTER.next_serial();
                     let button = event.button_code();
                     if event.state() == ButtonState::Pressed {
-                        // change the keyboard focus unless the pointer or keyboard is grabbed
+                        // change the keyboard focus unless the pointer is grabbed
                         // We test for any matching surface type here but always use the root
                         // (in case of a window the toplevel) surface for the focus.
                         // see: https://gitlab.freedesktop.org/wayland/wayland/-/issues/294
-                        if !seat.get_pointer().unwrap().is_grabbed()
-                            && !seat.get_keyboard().map(|k| k.is_grabbed()).unwrap_or(false)
-                        {
+                        if !seat.get_pointer().unwrap().is_grabbed() {
                             let output = seat.active_output();
 
                             let pos = seat.get_pointer().unwrap().current_location().as_global();
                             let relative_pos = pos.to_local(&output);
-                            let mut under = None;
+                            let mut under: Option<KeyboardFocusTarget> = None;
 
                             if let Some(session_lock) = self.common.shell.session_lock.as_ref() {
                                 under = session_lock
@@ -946,7 +977,9 @@ impl State {
                                     }
                                 };
                                 if !done {
-                                    if let Some((target, _)) =
+                                    // Don't check override redirect windows, because we don't set keyboard focus to them explicitly.
+                                    // These cases are handled by the XwaylandKeyboardGrab.
+                                    if let Some(target) =
                                         self.common.shell.element_under(pos, &output)
                                     {
                                         under = Some(target);
@@ -981,12 +1014,7 @@ impl State {
                                     }
                                 }
                             }
-                            Common::set_focus(
-                                self,
-                                under.and_then(|target| target.try_into().ok()).as_ref(),
-                                &seat,
-                                Some(serial),
-                            );
+                            Common::set_focus(self, under.as_ref(), &seat, Some(serial));
                         }
                     } else {
                         if let OverviewMode::Started(Trigger::Pointer(action_button), _) =
@@ -1286,19 +1314,18 @@ impl State {
                     let under = State::surface_under(position, &output, &mut self.common.shell)
                         .map(|(target, pos)| (target, pos.as_logical()));
 
-                    if let Some((target, pos)) = under {
-                        if let Some(wl_surface) = target.wl_surface() {
-                            let serial = SERIAL_COUNTER.next_serial();
-                            let touch = seat.get_touch().unwrap();
-                            touch.down(
-                                serial,
-                                event.time_msec(),
-                                &wl_surface,
-                                position.as_logical() - pos.to_f64(),
-                                event.slot(),
-                            );
-                        }
-                    }
+                    let serial = SERIAL_COUNTER.next_serial();
+                    let touch = seat.get_touch().unwrap();
+                    touch.down(
+                        self,
+                        under,
+                        &DownEvent {
+                            slot: event.slot(),
+                            location: position.as_logical(),
+                            serial,
+                            time: event.time_msec(),
+                        },
+                    );
                 }
             }
             InputEvent::TouchMotion { event, .. } => {
@@ -1319,30 +1346,44 @@ impl State {
                     let under = State::surface_under(position, &output, &mut self.common.shell)
                         .map(|(target, pos)| (target, pos.as_logical()));
 
-                    if let Some((_target, pos)) = under {
-                        let touch = seat.get_touch().unwrap();
-                        touch.motion(
-                            event.time_msec(),
-                            event.slot(),
-                            position.as_logical() - pos.to_f64(),
-                        );
-                    }
+                    let touch = seat.get_touch().unwrap();
+                    touch.motion(
+                        self,
+                        under,
+                        &TouchMotionEvent {
+                            slot: event.slot(),
+                            location: position.as_logical(),
+                            time: event.time_msec(),
+                        },
+                    );
                 }
             }
             InputEvent::TouchUp { event, .. } => {
                 if let Some(seat) = self.common.seat_with_device(&event.device()) {
                     let serial = SERIAL_COUNTER.next_serial();
                     let touch = seat.get_touch().unwrap();
-                    touch.up(serial, event.time_msec(), event.slot());
+                    touch.up(
+                        self,
+                        &UpEvent {
+                            slot: event.slot(),
+                            time: event.time_msec(),
+                            serial,
+                        },
+                    );
                 }
             }
             InputEvent::TouchCancel { event, .. } => {
                 if let Some(seat) = self.common.seat_with_device(&event.device()) {
                     let touch = seat.get_touch().unwrap();
-                    touch.cancel();
+                    touch.cancel(self);
                 }
             }
-            InputEvent::TouchFrame { event: _, .. } => {}
+            InputEvent::TouchFrame { event, .. } => {
+                if let Some(seat) = self.common.seat_with_device(&event.device()) {
+                    let touch = seat.get_touch().unwrap();
+                    touch.frame(self);
+                }
+            }
             InputEvent::TabletToolAxis { event, .. } => {
                 if let Some(seat) = self.common.seat_with_device(&event.device()).cloned() {
                     let Some(output) =
@@ -2269,7 +2310,10 @@ impl State {
         if let Some(session_lock) = session_lock {
             return session_lock.surfaces.get(output).map(|surface| {
                 (
-                    PointerFocusTarget::LockSurface(surface.clone()),
+                    PointerFocusTarget::WlSurface {
+                        surface: surface.wl_surface().clone(),
+                        toplevel: None,
+                    },
                     output_geo.loc,
                 )
             });
@@ -2279,22 +2323,42 @@ impl State {
             let layers = layer_map_for_output(output);
             if let Some(layer) = layers.layer_under(WlrLayer::Overlay, relative_pos.as_logical()) {
                 let layer_loc = layers.layer_geometry(layer).unwrap().loc;
-                if layer
-                    .surface_under(
-                        relative_pos.as_logical() - layer_loc.to_f64(),
-                        WindowSurfaceType::ALL,
-                    )
-                    .is_some()
-                {
-                    return Some((layer.clone().into(), output_geo.loc + layer_loc.as_global()));
+                if let Some((wl_surface, surface_loc)) = layer.surface_under(
+                    relative_pos.as_logical() - layer_loc.to_f64(),
+                    WindowSurfaceType::ALL,
+                ) {
+                    return Some((
+                        PointerFocusTarget::WlSurface {
+                            surface: wl_surface,
+                            toplevel: None,
+                        },
+                        output_geo.loc + layer_loc.as_global() + surface_loc.as_global(),
+                    ));
                 }
             }
-            if let Some(or) = shell.override_redirect_windows.iter().find(|or| {
-                or.is_in_input_region(&(global_pos.as_logical() - or.geometry().loc.to_f64()))
-            }) {
-                return Some((or.clone().into(), or.geometry().loc.as_global()));
+            if let Some((surface, geo)) = shell
+                .override_redirect_windows
+                .iter()
+                .find(|or| {
+                    or.is_in_input_region(
+                        &(global_pos.as_logical() - X11Surface::geometry(*or).loc.to_f64()),
+                    )
+                })
+                .and_then(|or| {
+                    or.wl_surface()
+                        .map(|surface| (surface, X11Surface::geometry(or).loc.as_global()))
+                })
+            {
+                return Some((
+                    PointerFocusTarget::WlSurface {
+                        surface,
+                        toplevel: None,
+                    },
+                    geo,
+                ));
             }
-            Some((window.clone().into(), output_geo.loc))
+            PointerFocusTarget::under_surface(window, relative_pos.as_logical())
+                .map(|(target, surface_loc)| (target, output_geo.loc + surface_loc.as_global()))
         } else {
             {
                 let layers = layer_map_for_output(output);
@@ -2303,26 +2367,42 @@ impl State {
                     .or_else(|| layers.layer_under(WlrLayer::Top, relative_pos.as_logical()))
                 {
                     let layer_loc = layers.layer_geometry(layer).unwrap().loc;
-                    if layer
-                        .surface_under(
-                            relative_pos.as_logical() - layer_loc.to_f64(),
-                            WindowSurfaceType::ALL,
-                        )
-                        .is_some()
-                    {
+                    if let Some((wl_surface, surface_loc)) = layer.surface_under(
+                        relative_pos.as_logical() - layer_loc.to_f64(),
+                        WindowSurfaceType::ALL,
+                    ) {
                         return Some((
-                            layer.clone().into(),
-                            output_geo.loc + layer_loc.as_global(),
+                            PointerFocusTarget::WlSurface {
+                                surface: wl_surface,
+                                toplevel: None,
+                            },
+                            output_geo.loc + layer_loc.as_global() + surface_loc.as_global(),
                         ));
                     }
                 }
             }
-            if let Some(or) = shell.override_redirect_windows.iter().find(|or| {
-                or.is_in_input_region(&(global_pos.as_logical() - or.geometry().loc.to_f64()))
-            }) {
-                return Some((or.clone().into(), or.geometry().loc.as_global()));
+            if let Some((surface, geo)) = shell
+                .override_redirect_windows
+                .iter()
+                .find(|or| {
+                    or.is_in_input_region(
+                        &(global_pos.as_logical() - X11Surface::geometry(*or).loc.to_f64()),
+                    )
+                })
+                .and_then(|or| {
+                    or.wl_surface()
+                        .map(|surface| (surface, X11Surface::geometry(or).loc.as_global()))
+                })
+            {
+                return Some((
+                    PointerFocusTarget::WlSurface {
+                        surface,
+                        toplevel: None,
+                    },
+                    geo,
+                ));
             }
-            if let Some((target, loc)) = shell.element_under(global_pos, output) {
+            if let Some((target, loc)) = shell.surface_under(global_pos, output) {
                 return Some((target, loc));
             }
             {
@@ -2332,16 +2412,16 @@ impl State {
                     .or_else(|| layers.layer_under(WlrLayer::Background, relative_pos.as_logical()))
                 {
                     let layer_loc = layers.layer_geometry(layer).unwrap().loc;
-                    if layer
-                        .surface_under(
-                            relative_pos.as_logical() - layer_loc.to_f64(),
-                            WindowSurfaceType::ALL,
-                        )
-                        .is_some()
-                    {
+                    if let Some((wl_surface, surface_loc)) = layer.surface_under(
+                        relative_pos.as_logical() - layer_loc.to_f64(),
+                        WindowSurfaceType::ALL,
+                    ) {
                         return Some((
-                            layer.clone().into(),
-                            output_geo.loc + layer_loc.as_global(),
+                            PointerFocusTarget::WlSurface {
+                                surface: wl_surface,
+                                toplevel: None,
+                            },
+                            output_geo.loc + layer_loc.as_global() + surface_loc.as_global(),
                         ));
                     }
                 }
@@ -2401,51 +2481,22 @@ impl State {
     }
 }
 
-fn sessions_for_output(state: &Common, output: &Output) -> impl Iterator<Item = Session> {
+fn cursor_sessions_for_output(
+    state: &Common,
+    output: &Output,
+) -> impl Iterator<Item = CursorSession> {
     let workspace = state.shell.active_space(&output);
     let maybe_fullscreen = workspace.get_fullscreen();
     workspace
-        .screencopy_sessions
-        .iter()
-        .map(|s| (&**s).clone())
+        .cursor_sessions()
+        .into_iter()
         .chain(
             maybe_fullscreen
-                .as_ref()
-                .and_then(|w| {
-                    if let Some(sessions) = w.user_data().get::<ScreencopySessions>() {
-                        Some(
-                            sessions
-                                .0
-                                .borrow()
-                                .iter()
-                                .map(|s| (&**s).clone())
-                                .collect::<Vec<_>>(),
-                        )
-                    } else {
-                        None
-                    }
-                })
+                .map(|w| w.cursor_sessions())
                 .into_iter()
                 .flatten(),
         )
-        .chain(
-            output
-                .user_data()
-                .get::<ScreencopySessions>()
-                .map(|sessions| {
-                    sessions
-                        .0
-                        .borrow()
-                        .iter()
-                        .map(|s| (&**s).clone())
-                        .collect::<Vec<_>>()
-                })
-                .into_iter()
-                .into_iter()
-                .flatten(),
-        )
-        .collect::<Vec<_>>()
-        .into_iter()
+        .chain(output.cursor_sessions().into_iter())
 }
 
 // TODO Is it possible to determine mapping for external touchscreen?

@@ -5,12 +5,8 @@ use crate::{
     shell::{focus::target::KeyboardFocusTarget, grabs::ReleaseMode, CosmicSurface, Shell},
     state::State,
     utils::prelude::*,
-    wayland::{
-        handlers::{
-            screencopy::PendingScreencopyBuffers, toplevel_management::ToplevelManagementExt,
-            xdg_activation::ActivationContext,
-        },
-        protocols::screencopy::SessionType,
+    wayland::handlers::{
+        toplevel_management::ToplevelManagementExt, xdg_activation::ActivationContext,
     },
 };
 use smithay::{
@@ -136,6 +132,104 @@ impl State {
     }
 }
 
+impl Common {
+    fn is_x_focused(&self, xwm: XwmId) -> bool {
+        if let Some(keyboard) = self.last_active_seat().get_keyboard() {
+            if let Some(KeyboardFocusTarget::Element(mapped)) = keyboard.current_focus() {
+                if let Some(surface) = mapped.active_window().x11_surface() {
+                    return surface.xwm_id().unwrap() == xwm;
+                }
+            }
+        }
+
+        false
+    }
+
+    pub fn update_x11_stacking_order(&mut self) {
+        let active_output = self.last_active_seat().active_output();
+        if let Some(xwm) = self
+            .shell
+            .xwayland_state
+            .as_mut()
+            .and_then(|state| state.xwm.as_mut())
+        {
+            // front to back, given that is how the workspace enumerates
+            let order = self
+                .shell
+                .workspaces
+                .sets
+                .iter()
+                .filter(|(output, _)| *output == &active_output)
+                .chain(
+                    self.shell
+                        .workspaces
+                        .sets
+                        .iter()
+                        .filter(|(output, _)| *output != &active_output),
+                )
+                .flat_map(|(_, set)| {
+                    set.sticky_layer
+                        .mapped()
+                        .flat_map(|mapped| {
+                            let active = mapped.active_window();
+                            std::iter::once(active.clone()).chain(
+                                mapped
+                                    .is_stack()
+                                    .then(move || {
+                                        mapped
+                                            .windows()
+                                            .map(|(s, _)| s)
+                                            .filter(move |s| s != &active)
+                                    })
+                                    .into_iter()
+                                    .flatten(),
+                            )
+                        })
+                        .chain(
+                            set.workspaces
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, _)| *i == set.active)
+                                .chain(
+                                    set.workspaces
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(i, _)| *i != set.active),
+                                )
+                                .flat_map(|(_, workspace)| {
+                                    workspace.get_fullscreen().cloned().into_iter().chain(
+                                        workspace.mapped().flat_map(|mapped| {
+                                            let active = mapped.active_window();
+                                            std::iter::once(active.clone()).chain(
+                                                mapped
+                                                    .is_stack()
+                                                    .then(move || {
+                                                        mapped
+                                                            .windows()
+                                                            .map(|(s, _)| s)
+                                                            .filter(move |s| s != &active)
+                                                    })
+                                                    .into_iter()
+                                                    .flatten(),
+                                            )
+                                        }),
+                                    )
+                                }),
+                        )
+                })
+                .collect::<Vec<_>>();
+
+            // we don't include the popup elements, which contain the OR windows, because we are not supposed to restack them.
+            // Which is also why we match upwards, to not disturb elements at the top.
+            //
+            // But this also means we need to match across all outputs and workspaces at once, to be sure nothing that shouldn't be on top of us is.
+            if let Err(err) = xwm.update_stacking_order_upwards(order.iter().rev()) {
+                warn!(wm_id = ?xwm.id(), ?err, "Failed to update Xwm stacking order.");
+            }
+        }
+    }
+}
+
 impl XwmHandler for State {
     fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
         self.common
@@ -156,7 +250,7 @@ impl XwmHandler for State {
         }
 
         let startup_id = window.startup_id();
-        if self.common.shell.element_for_x11_surface(&window).is_some() {
+        if self.common.shell.element_for_surface(&window).is_some() {
             return;
         }
 
@@ -237,28 +331,9 @@ impl XwmHandler for State {
                 .shell
                 .override_redirect_windows
                 .retain(|or| or != &window);
-        } else if let Some((element, space)) = self
-            .common
-            .shell
-            .element_for_x11_surface(&window)
-            .cloned()
-            .and_then(|element| {
-                self.common
-                    .shell
-                    .space_for_mut(&element)
-                    .map(|space| (element, space))
-            })
-        {
-            if element.is_stack() && element.stack_ref().unwrap().len() >= 2 {
-                if let Some((surface, _)) = element
-                    .windows()
-                    .find(|(w, _)| w.x11_surface() == Some(&window))
-                {
-                    element.stack_ref().unwrap().remove_window(&surface);
-                }
-            } else {
-                space.unmap(&element);
-            }
+        } else {
+            let seat = self.common.last_active_seat().clone();
+            self.common.shell.unmap_surface(&window, &seat);
         }
 
         let outputs = if let Some(wl_surface) = window.wl_surface() {
@@ -275,36 +350,9 @@ impl XwmHandler for State {
             self.common.shell.refresh_active_space(output);
         }
 
-        // screencopy
-        let mut scheduled_sessions = window
-            .wl_surface()
-            .map(|wl_surface| self.schedule_workspace_sessions(&wl_surface))
-            .unwrap_or_default();
-
         for output in outputs.into_iter() {
-            if let Some(sessions) = output.user_data().get::<PendingScreencopyBuffers>() {
-                scheduled_sessions
-                    .get_or_insert_with(Vec::new)
-                    .extend(sessions.borrow_mut().drain(..));
-            }
-            self.backend.schedule_render(
-                &self.common.event_loop_handle,
-                &output,
-                scheduled_sessions.as_ref().map(|sessions| {
-                    sessions
-                        .iter()
-                        .filter(|(s, _)| match s.session_type() {
-                            SessionType::Output(o) | SessionType::Workspace(o, _)
-                                if o == output =>
-                            {
-                                true
-                            }
-                            _ => false,
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>()
-                }),
-            );
+            self.backend
+                .schedule_render(&self.common.event_loop_handle, &output);
         }
     }
 
@@ -320,7 +368,7 @@ impl XwmHandler for State {
     ) {
         // We only allow floating X11 windows to resize themselves. Nothing else
         let mut current_geo = window.geometry();
-        if let Some(mapped) = self.common.shell.element_for_x11_surface(&window) {
+        if let Some(mapped) = self.common.shell.element_for_surface(&window) {
             let is_floating = self
                 .common
                 .shell
@@ -431,20 +479,20 @@ impl XwmHandler for State {
     }
 
     fn maximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        if let Some(mapped) = self.common.shell.element_for_x11_surface(&window).cloned() {
+        if let Some(mapped) = self.common.shell.element_for_surface(&window).cloned() {
             let seat = self.common.last_active_seat().clone();
             self.common.shell.maximize_request(&mapped, &seat);
         }
     }
 
     fn unmaximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        if let Some(mapped) = self.common.shell.element_for_x11_surface(&window).cloned() {
+        if let Some(mapped) = self.common.shell.element_for_surface(&window).cloned() {
             self.common.shell.unmaximize_request(&mapped);
         }
     }
 
     fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        if let Some(mapped) = self.common.shell.element_for_x11_surface(&window).cloned() {
+        if let Some(mapped) = self.common.shell.element_for_surface(&window).cloned() {
             if !mapped.is_stack() || mapped.active_window().is_window(&window) {
                 self.common.shell.minimize_request(&mapped);
             }
@@ -452,7 +500,7 @@ impl XwmHandler for State {
     }
 
     fn unminimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        if let Some(mut mapped) = self.common.shell.element_for_x11_surface(&window).cloned() {
+        if let Some(mut mapped) = self.common.shell.element_for_surface(&window).cloned() {
             let seat = self.common.last_active_seat().clone();
             self.common.shell.unminimize_request(&mapped, &seat);
             if mapped.is_stack() {
@@ -466,7 +514,7 @@ impl XwmHandler for State {
 
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
         let seat = self.common.last_active_seat().clone();
-        if let Some(mapped) = self.common.shell.element_for_x11_surface(&window).cloned() {
+        if let Some(mapped) = self.common.shell.element_for_surface(&window).cloned() {
             if let Some((output, handle)) = self
                 .common
                 .shell
@@ -506,7 +554,7 @@ impl XwmHandler for State {
     }
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        if let Some(mapped) = self.common.shell.element_for_x11_surface(&window).cloned() {
+        if let Some(mapped) = self.common.shell.element_for_surface(&window).cloned() {
             if let Some(workspace) = self.common.shell.space_for_mut(&mapped) {
                 let (window, _) = mapped
                     .windows()
@@ -581,19 +629,5 @@ impl XwmHandler for State {
                 }
             }
         }
-    }
-}
-
-impl Common {
-    fn is_x_focused(&self, xwm: XwmId) -> bool {
-        if let Some(keyboard) = self.last_active_seat().get_keyboard() {
-            if let Some(KeyboardFocusTarget::Element(mapped)) = keyboard.current_focus() {
-                if let Some(surface) = mapped.active_window().x11_surface() {
-                    return surface.xwm_id().unwrap() == xwm;
-                }
-            }
-        }
-
-        false
     }
 }

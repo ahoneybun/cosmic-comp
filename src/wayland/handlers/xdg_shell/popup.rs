@@ -19,17 +19,16 @@ use smithay::{
         seat::WaylandFocus,
         shell::xdg::{
             PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface,
-            XdgPopupSurfaceRoleAttributes, XDG_POPUP_ROLE,
+            XdgPopupSurfaceData, XDG_POPUP_ROLE,
         },
     },
 };
-use std::sync::Mutex;
 use tracing::{trace, warn};
 
 impl Shell {
     pub fn unconstrain_popup(&self, surface: &PopupSurface) {
         if let Some(parent) = get_popup_toplevel(&surface) {
-            if let Some(elem) = self.element_for_wl_surface(&parent) {
+            if let Some(elem) = self.element_for_surface(&parent) {
                 let (mut element_geo, output, is_tiled) =
                     if let Some(workspace) = self.space_for(elem) {
                         let Some(elem_geo) = workspace.element_geometry(elem) else {
@@ -96,7 +95,7 @@ pub fn update_reactive_popups<'a>(
                 let positioner = with_states(&surface.wl_surface(), |states| {
                     let attributes = states
                         .data_map
-                        .get::<Mutex<XdgPopupSurfaceRoleAttributes>>()
+                        .get::<XdgPopupSurfaceData>()
                         .unwrap()
                         .lock()
                         .unwrap();
@@ -378,7 +377,7 @@ pub fn get_popup_toplevel(popup: &PopupSurface) -> Option<WlSurface> {
         parent = with_states(&parent, |states| {
             states
                 .data_map
-                .get::<Mutex<XdgPopupSurfaceRoleAttributes>>()
+                .get::<XdgPopupSurfaceData>()
                 .unwrap()
                 .lock()
                 .unwrap()
@@ -402,7 +401,7 @@ fn get_popup_toplevel_coords(popup: &PopupSurface) -> Point<i32, Logical> {
         offset += with_states(&parent, |states| {
             states
                 .data_map
-                .get::<Mutex<XdgPopupSurfaceRoleAttributes>>()
+                .get::<XdgPopupSurfaceData>()
                 .unwrap()
                 .lock()
                 .unwrap()
@@ -413,7 +412,7 @@ fn get_popup_toplevel_coords(popup: &PopupSurface) -> Point<i32, Logical> {
         parent = with_states(&parent, |states| {
             states
                 .data_map
-                .get::<Mutex<XdgPopupSurfaceRoleAttributes>>()
+                .get::<XdgPopupSurfaceData>()
                 .unwrap()
                 .lock()
                 .unwrap()

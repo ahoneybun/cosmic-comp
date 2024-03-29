@@ -3,7 +3,6 @@
 use crate::{
     shell::{element::CosmicWindow, grabs::ReleaseMode, CosmicMapped, CosmicSurface, ManagedLayer},
     utils::prelude::*,
-    wayland::protocols::screencopy::SessionType,
 };
 use smithay::{
     delegate_xdg_shell,
@@ -30,10 +29,7 @@ use smithay::{
 use std::cell::Cell;
 use tracing::warn;
 
-use super::{
-    compositor::client_compositor_state, screencopy::PendingScreencopyBuffers,
-    toplevel_management::ToplevelManagementExt,
-};
+use super::{compositor::client_compositor_state, toplevel_management::ToplevelManagementExt};
 
 pub mod popup;
 
@@ -76,7 +72,7 @@ impl XdgShellHandler for State {
         let kind = PopupKind::Xdg(surface);
         if let Some(root) = find_popup_root_surface(&kind)
             .ok()
-            .and_then(|root| self.common.shell.element_for_wl_surface(&root))
+            .and_then(|root| self.common.shell.element_for_surface(&root))
         {
             let target = root.clone().into();
             let ret = self
@@ -169,7 +165,7 @@ impl XdgShellHandler for State {
         if let Some(mapped) = self
             .common
             .shell
-            .element_for_wl_surface(surface.wl_surface())
+            .element_for_surface(surface.wl_surface())
             .cloned()
         {
             if !mapped.is_stack()
@@ -184,7 +180,7 @@ impl XdgShellHandler for State {
         if let Some(mapped) = self
             .common
             .shell
-            .element_for_wl_surface(surface.wl_surface())
+            .element_for_surface(surface.wl_surface())
             .cloned()
         {
             let seat = self.common.last_active_seat().clone();
@@ -196,7 +192,7 @@ impl XdgShellHandler for State {
         if let Some(mapped) = self
             .common
             .shell
-            .element_for_wl_surface(surface.wl_surface())
+            .element_for_surface(surface.wl_surface())
             .cloned()
         {
             self.common.shell.unmaximize_request(&mapped);
@@ -214,7 +210,7 @@ impl XdgShellHandler for State {
         if let Some(mapped) = self
             .common
             .shell
-            .element_for_wl_surface(surface.wl_surface())
+            .element_for_surface(surface.wl_surface())
             .cloned()
         {
             let from = self
@@ -351,7 +347,7 @@ impl XdgShellHandler for State {
         if let Some(mapped) = self
             .common
             .shell
-            .element_for_wl_surface(surface.wl_surface())
+            .element_for_surface(surface.wl_surface())
             .cloned()
         {
             if let Some(workspace) = self.common.shell.space_for_mut(&mapped) {
@@ -382,6 +378,9 @@ impl XdgShellHandler for State {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        let seat = self.common.last_active_seat().clone();
+        self.common.shell.unmap_surface(surface.wl_surface(), &seat);
+
         let output = self
             .common
             .shell
@@ -400,32 +399,9 @@ impl XdgShellHandler for State {
             }
         }
 
-        // screencopy
-        let mut scheduled_sessions = self.schedule_workspace_sessions(surface.wl_surface());
         if let Some(output) = output.as_ref() {
-            if let Some(sessions) = output.user_data().get::<PendingScreencopyBuffers>() {
-                scheduled_sessions
-                    .get_or_insert_with(Vec::new)
-                    .extend(sessions.borrow_mut().drain(..));
-            }
-            self.backend.schedule_render(
-                &self.common.event_loop_handle,
-                &output,
-                scheduled_sessions.as_ref().map(|sessions| {
-                    sessions
-                        .iter()
-                        .filter(|(s, _)| match s.session_type() {
-                            SessionType::Output(o) | SessionType::Workspace(o, _)
-                                if &o == output =>
-                            {
-                                true
-                            }
-                            _ => false,
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>()
-                }),
-            );
+            self.backend
+                .schedule_render(&self.common.event_loop_handle, &output);
         }
     }
 

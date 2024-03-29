@@ -10,9 +10,8 @@ use crate::{
     state::State,
     utils::{prelude::*, tween::EaseRectangle},
     wayland::{
-        handlers::screencopy::DropableSession,
+        handlers::screencopy::ScreencopySessions,
         protocols::{
-            screencopy::{BufferParams, Session as ScreencopySession},
             toplevel_info::ToplevelInfoState,
             workspace::{WorkspaceHandle, WorkspaceUpdateGuard},
         },
@@ -34,17 +33,16 @@ use smithay::{
         glow::{GlowFrame, GlowRenderer},
         ImportAll, ImportMem, Renderer,
     },
-    desktop::{layer_map_for_output, space::SpaceElement, WindowSurfaceType},
+    desktop::{layer_map_for_output, space::SpaceElement},
     input::Seat,
     output::Output,
-    reexports::wayland_server::{protocol::wl_surface::WlSurface, Client, Resource},
+    reexports::wayland_server::{Client, Resource},
     utils::{Buffer as BufferCoords, IsAlive, Logical, Physical, Point, Rectangle, Scale, Size},
     wayland::{
         compositor::{add_blocker, Blocker, BlockerState},
         seat::WaylandFocus,
         xdg_activation::{XdgActivationState, XdgActivationToken},
     },
-    xwayland::X11Surface,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -84,8 +82,7 @@ pub struct Workspace {
 
     pub handle: WorkspaceHandle,
     pub focus_stack: FocusStacks,
-    pub pending_buffers: Vec<(ScreencopySession, BufferParams)>,
-    pub screencopy_sessions: Vec<DropableSession>,
+    pub screencopy: ScreencopySessions,
     pub output_stack: VecDeque<String>,
     pub pending_tokens: HashSet<XdgActivationToken>,
     pub(super) backdrop_id: Id,
@@ -273,8 +270,7 @@ impl Workspace {
             fullscreen: None,
             handle,
             focus_stack: FocusStacks::default(),
-            pending_buffers: Vec::new(),
-            screencopy_sessions: Vec::new(),
+            screencopy: ScreencopySessions::default(),
             output_stack: {
                 let mut queue = VecDeque::new();
                 queue.push_back(output_name);
@@ -362,29 +358,6 @@ impl Workspace {
         clients.extend(self.tiling_layer.update_animation_state());
         self.floating_layer.update_animation_state();
         clients
-    }
-
-    pub fn commit(&mut self, surface: &WlSurface) {
-        if let Some(mapped) = self.element_for_wl_surface(surface) {
-            mapped
-                .windows()
-                .find(|(w, _)| w.wl_surface().as_ref() == Some(surface))
-                .unwrap()
-                .0
-                .on_commit();
-        }
-        if let Some(mapped) = self.minimized_windows.iter().find_map(|m| {
-            m.window
-                .has_surface(surface, WindowSurfaceType::TOPLEVEL)
-                .then_some(&m.window)
-        }) {
-            mapped
-                .windows()
-                .find(|(w, _)| w.wl_surface().as_ref() == Some(surface))
-                .unwrap()
-                .0
-                .on_commit();
-        }
     }
 
     pub fn output(&self) -> &Output {
@@ -483,7 +456,10 @@ impl Workspace {
         }
     }
 
-    pub fn element_for_surface(&self, surface: &CosmicSurface) -> Option<&CosmicMapped> {
+    pub fn element_for_surface<S>(&self, surface: &S) -> Option<&CosmicMapped>
+    where
+        CosmicSurface: PartialEq<S>,
+    {
         self.floating_layer
             .mapped()
             .chain(self.tiling_layer.mapped().map(|(w, _)| w))
@@ -491,34 +467,22 @@ impl Workspace {
             .find(|e| e.windows().any(|(w, _)| &w == surface))
     }
 
-    pub fn element_for_wl_surface(&self, surface: &WlSurface) -> Option<&CosmicMapped> {
+    pub fn element_under(&mut self, location: Point<f64, Global>) -> Option<KeyboardFocusTarget> {
+        let location = location.to_local(&self.output);
         self.floating_layer
-            .mapped()
-            .chain(self.tiling_layer.mapped().map(|(w, _)| w))
-            .chain(self.minimized_windows.iter().map(|w| &w.window))
-            .find(|e| {
-                e.windows()
-                    .any(|(w, _)| w.wl_surface().as_ref() == Some(surface))
-            })
+            .element_under(location)
+            .or_else(|| self.tiling_layer.element_under(location))
     }
 
-    pub fn element_for_x11_surface(&self, surface: &X11Surface) -> Option<&CosmicMapped> {
-        self.floating_layer
-            .mapped()
-            .chain(self.tiling_layer.mapped().map(|(w, _)| w))
-            .chain(self.minimized_windows.iter().map(|w| &w.window))
-            .find(|e| e.windows().any(|(w, _)| w.x11_surface() == Some(surface)))
-    }
-
-    pub fn element_under(
+    pub fn surface_under(
         &mut self,
         location: Point<f64, Global>,
         overview: OverviewMode,
     ) -> Option<(PointerFocusTarget, Point<i32, Global>)> {
         let location = location.to_local(&self.output);
         self.floating_layer
-            .element_under(location)
-            .or_else(|| self.tiling_layer.element_under(location, overview))
+            .surface_under(location)
+            .or_else(|| self.tiling_layer.surface_under(location, overview))
             .map(|(m, p)| (m, p.to_global(&self.output)))
     }
 
@@ -605,7 +569,7 @@ impl Workspace {
             None
         };
 
-        if self.is_tiled(elem) {
+        if self.tiling_layer.mapped().any(|(m, _)| m == elem) {
             let was_maximized = self.floating_layer.unmap(&elem);
             let tiling_state = self.tiling_layer.unmap_minimize(elem, to);
             Some(MinimizedWindow {

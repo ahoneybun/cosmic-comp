@@ -670,6 +670,14 @@ impl FloatingLayout {
         window: CosmicMapped,
         position: Point<i32, Local>,
     ) -> (CosmicMapped, Point<i32, Local>) {
+        if self
+            .hovered_stack
+            .as_ref()
+            .is_some_and(|(stack, _)| stack == &window || !stack.alive())
+        {
+            let _ = self.hovered_stack.take();
+        }
+
         if let Some((mapped, geo)) = self.hovered_stack.take() {
             let stack = mapped.stack_ref().unwrap();
             for surface in window.windows().map(|s| s.0) {
@@ -686,7 +694,13 @@ impl FloatingLayout {
         self.space.element_geometry(elem).map(RectExt::as_local)
     }
 
-    pub fn element_under(
+    pub fn element_under(&mut self, location: Point<f64, Local>) -> Option<KeyboardFocusTarget> {
+        self.space
+            .element_under(location.as_logical())
+            .map(|(mapped, _)| mapped.clone().into())
+    }
+
+    pub fn surface_under(
         &mut self,
         location: Point<f64, Local>,
     ) -> Option<(PointerFocusTarget, Point<i32, Local>)> {
@@ -694,6 +708,7 @@ impl FloatingLayout {
             .space
             .element_under(location.as_logical())
             .map(|(mapped, p)| (mapped.clone(), p.as_local()));
+
         if let Some((mapped, _)) = res.as_ref() {
             let geometry = self.space.element_geometry(mapped).unwrap();
             let offset = location.y.round() as i32 - geometry.loc.y;
@@ -705,7 +720,15 @@ impl FloatingLayout {
         } else {
             self.hovered_stack.take();
         }
-        res.map(|(m, p)| (m.into(), p))
+
+        res.and_then(|(element, space_offset)| {
+            let point = location - space_offset.to_f64();
+            element
+                .focus_under(point.as_logical())
+                .map(|(surface, surface_offset)| {
+                    (surface, space_offset + surface_offset.as_local())
+                })
+        })
     }
 
     pub fn stacking_indicator(&self) -> Option<Rectangle<i32, Local>> {
@@ -899,13 +922,14 @@ impl FloatingLayout {
         direction: Direction,
         seat: &Seat<State>,
         layer: ManagedLayer,
-        theme: cosmic::Theme,
+        theme: &cosmic::Theme,
         element: &CosmicMapped,
     ) -> MoveResult {
         match element.handle_move(direction) {
             StackMoveResult::Handled => MoveResult::Done,
             StackMoveResult::MoveOut(surface, loop_handle) => {
-                let mapped: CosmicMapped = CosmicWindow::new(surface, loop_handle, theme).into();
+                let mapped: CosmicMapped =
+                    CosmicWindow::new(surface, loop_handle, theme.clone()).into();
                 let output = seat.active_output();
                 let pos = self.space.element_geometry(element).unwrap().loc
                     + match direction {
@@ -1084,7 +1108,7 @@ impl FloatingLayout {
             return MoveResult::None;
         };
 
-        self.move_element(direction, seat, layer, theme, &focused.clone())
+        self.move_element(direction, seat, layer, &theme, &focused.clone())
     }
 
     pub fn mapped(&self) -> impl Iterator<Item = &CosmicMapped> {

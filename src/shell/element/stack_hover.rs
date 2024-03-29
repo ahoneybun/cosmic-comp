@@ -5,10 +5,13 @@ use crate::{
 
 use calloop::LoopHandle;
 use cosmic::{
-    iced::widget::{container, row},
-    iced_core::{Background, Color, Length},
+    iced::{
+        widget::{container, row},
+        Alignment,
+    },
+    iced_core::{Background, Border, Color, Length},
     theme,
-    widget::{icon::from_name, text},
+    widget::{horizontal_space, icon::from_name, text},
     Apply,
 };
 use smithay::utils::{Logical, Size};
@@ -28,49 +31,43 @@ pub struct StackHoverInternal;
 impl Program for StackHoverInternal {
     type Message = ();
 
-    fn view(&self) -> crate::utils::iced::Element<'_, Self::Message> {
+    fn view(&self) -> cosmic::Element<'_, Self::Message> {
         row(vec![
             from_name("window-stack-symbolic")
-                .size(24)
+                .size(32)
                 .prefer_svg(true)
                 .icon()
-                .apply(container)
-                .padding([0, 8, 0, 0])
-                .width(Length::Shrink)
-                .apply(container)
-                .center_y()
-                .height(Length::Fill)
                 .into(),
+            horizontal_space(16).into(),
             text(fl!("stack-windows"))
                 .font(cosmic::font::FONT)
                 .size(24)
-                .line_height(1.3)
-                .apply(container)
-                .width(Length::Shrink)
-                .apply(container)
-                .center_y()
-                .height(Length::Fill)
                 .into(),
         ])
-        .width(Length::Shrink)
-        .height(Length::Shrink)
+        .align_items(Alignment::Center)
         .apply(container)
-        .padding([8, 16])
+        .center_x()
+        .center_y()
+        .padding(16)
+        .apply(container)
         .style(theme::Container::custom(|theme| container::Appearance {
             icon_color: Some(Color::from(theme.cosmic().accent.on)),
             text_color: Some(Color::from(theme.cosmic().accent.on)),
             background: Some(Background::Color(theme.cosmic().accent_color().into())),
-            border_radius: 24.0.into(),
-            border_width: 0.0,
-            border_color: Color::TRANSPARENT,
+            border: Border {
+                radius: 18.0.into(),
+                width: 0.0,
+                color: Color::TRANSPARENT,
+            },
+            shadow: Default::default(),
         }))
         .width(Length::Shrink)
-        .height(Length::Fixed(48.))
+        .height(Length::Shrink)
         .apply(container)
-        .center_x()
-        .center_y()
         .width(Length::Fill)
         .height(Length::Fill)
+        .center_x()
+        .center_y()
         .into()
     }
 }

@@ -29,7 +29,7 @@ use smithay::{
         },
         wayland_server::{protocol::wl_surface::WlSurface, Client, DisplayHandle},
     },
-    utils::{Logical, Point, Rectangle, Serial, Size, SERIAL_COUNTER},
+    utils::{IsAlive, Logical, Point, Rectangle, Serial, Size, SERIAL_COUNTER},
     wayland::{
         compositor::with_states,
         seat::WaylandFocus,
@@ -257,12 +257,19 @@ impl WorkspaceDelta {
     pub fn new_shortcut() -> Self {
         WorkspaceDelta::Shortcut(Instant::now())
     }
+
+    pub fn is_animating(&self) -> bool {
+        matches!(
+            self,
+            WorkspaceDelta::Shortcut(_) | WorkspaceDelta::GestureEnd(_, _)
+        )
+    }
 }
 
 #[derive(Debug)]
 pub struct WorkspaceSet {
     previously_active: Option<(usize, WorkspaceDelta)>,
-    active: usize,
+    pub active: usize,
     pub group: WorkspaceGroupHandle,
     idx: usize,
     tiling_enabled: bool,
@@ -1178,39 +1185,6 @@ impl Shell {
                         set.workspaces[set.active].tiling_layer.cleanup_drag();
                     }
                     set.activate(idx, workspace_delta, &mut self.workspace_state.update())?;
-                    if let Some(xwm) = self
-                        .xwayland_state
-                        .as_mut()
-                        .and_then(|state| state.xwm.as_mut())
-                    {
-                        {
-                            for window in set.workspaces[set.active]
-                                .tiling_layer
-                                .mapped()
-                                .map(|(w, _)| w)
-                                .chain(set.workspaces[set.active].floating_layer.space.elements())
-                            {
-                                if let Some(surf) = window.active_window().x11_surface() {
-                                    let _ = xwm.raise_window(surf);
-                                }
-                            }
-                            for window in set.sticky_layer.space.elements() {
-                                if let Some(surf) = window.active_window().x11_surface() {
-                                    let _ = xwm.raise_window(surf);
-                                }
-                            }
-                            if let Some(surf) = set.workspaces[set.active]
-                                .fullscreen
-                                .as_ref()
-                                .and_then(|f| f.surface.x11_surface())
-                            {
-                                let _ = xwm.raise_window(surf);
-                            }
-                        }
-                        for surface in &self.override_redirect_windows {
-                            let _ = xwm.raise_window(surface);
-                        }
-                    }
 
                     let output_geo = output.geometry();
                     Ok(Some(
@@ -1467,7 +1441,10 @@ impl Shell {
         }
     }
 
-    pub fn element_for_surface(&self, surface: &CosmicSurface) -> Option<&CosmicMapped> {
+    pub fn element_for_surface<S>(&self, surface: &S) -> Option<&CosmicMapped>
+    where
+        CosmicSurface: PartialEq<S>,
+    {
         self.workspaces.sets.values().find_map(|set| {
             set.minimized_windows
                 .iter()
@@ -1478,39 +1455,6 @@ impl Shell {
                     set.workspaces
                         .iter()
                         .find_map(|w| w.element_for_surface(surface))
-                })
-        })
-    }
-
-    pub fn element_for_wl_surface(&self, surface: &WlSurface) -> Option<&CosmicMapped> {
-        self.workspaces.sets.values().find_map(|set| {
-            set.minimized_windows
-                .iter()
-                .map(|w| &w.window)
-                .chain(set.sticky_layer.mapped())
-                .find(|w| {
-                    w.windows()
-                        .any(|(s, _)| s.wl_surface().as_ref() == Some(surface))
-                })
-                .or_else(|| {
-                    set.workspaces
-                        .iter()
-                        .find_map(|w| w.element_for_wl_surface(surface))
-                })
-        })
-    }
-
-    pub fn element_for_x11_surface(&self, surface: &X11Surface) -> Option<&CosmicMapped> {
-        self.workspaces.sets.values().find_map(|set| {
-            set.minimized_windows
-                .iter()
-                .map(|w| &w.window)
-                .chain(set.sticky_layer.mapped())
-                .find(|w| w.windows().any(|(s, _)| s.x11_surface() == Some(surface)))
-                .or_else(|| {
-                    set.workspaces
-                        .iter()
-                        .find_map(|w| w.element_for_x11_surface(surface))
                 })
         })
     }
@@ -1600,11 +1544,12 @@ impl Shell {
     }
 
     pub fn animations_going(&self) -> bool {
-        self.workspaces
-            .sets
-            .values()
-            .any(|set| set.previously_active.is_some() || set.sticky_layer.animations_going())
-            || !matches!(self.overview_mode, OverviewMode::None)
+        self.workspaces.sets.values().any(|set| {
+            set.previously_active
+                .as_ref()
+                .is_some_and(|(_, delta)| delta.is_animating())
+                || set.sticky_layer.animations_going()
+        }) || !matches!(self.overview_mode, OverviewMode::None)
             || !matches!(self.resize_mode, ResizeMode::None)
             || self
                 .workspaces
@@ -1745,8 +1690,18 @@ impl Shell {
             .iter()
             .for_each(|or| or.refresh());
 
+        self.pending_layers.retain(|(s, _, _)| s.alive());
+        self.pending_windows.retain(|(s, _, _)| s.alive());
+
         self.toplevel_info_state
             .refresh(Some(&self.workspace_state));
+    }
+
+    pub fn on_commit(&mut self, surface: &WlSurface) {
+        if let Some(mapped) = self.element_for_surface(surface) {
+            mapped.on_commit(surface);
+        }
+        self.popups.commit(surface);
     }
 
     pub fn remap_unfullscreened_window(
@@ -1819,7 +1774,7 @@ impl Shell {
 
         let parent_is_sticky = if let Some(toplevel) = window.0.toplevel() {
             if let Some(parent) = toplevel.parent() {
-                if let Some(elem) = state.common.shell.element_for_wl_surface(&parent) {
+                if let Some(elem) = state.common.shell.element_for_surface(&parent) {
                     state
                         .common
                         .shell
@@ -2057,7 +2012,76 @@ impl Shell {
         }
     }
 
+    pub fn unmap_surface<S>(&mut self, surface: &S, seat: &Seat<State>)
+    where
+        CosmicSurface: PartialEq<S>,
+    {
+        for set in self.workspaces.sets.values_mut() {
+            let sticky_res = set.sticky_layer.mapped().find_map(|m| {
+                m.windows()
+                    .position(|(s, _)| &s == surface)
+                    .map(|idx| (idx, m.clone()))
+            });
+            let surface = if let Some((idx, mut mapped)) = sticky_res {
+                if mapped.is_stack() {
+                    mapped.stack_ref_mut().unwrap().remove_idx(idx)
+                } else {
+                    set.sticky_layer.unmap(&mapped);
+                    Some(mapped.active_window())
+                }
+            } else if let Some(idx) = set
+                .minimized_windows
+                .iter()
+                .map(|w| &w.window)
+                .position(|w| w.windows().any(|(s, _)| &s == surface))
+            {
+                if set.minimized_windows.get(idx).unwrap().window.is_stack() {
+                    let window = &mut set.minimized_windows.get_mut(idx).unwrap().window;
+                    let stack = window.stack_ref_mut().unwrap();
+                    let idx = stack.surfaces().position(|s| &s == surface);
+                    idx.and_then(|idx| stack.remove_idx(idx))
+                } else {
+                    Some(set.minimized_windows.remove(idx).window.active_window())
+                }
+            } else if let Some((workspace, mut elem)) = set.workspaces.iter_mut().find_map(|w| {
+                w.element_for_surface(&surface)
+                    .cloned()
+                    .map(|elem| (w, elem))
+            }) {
+                if elem.is_stack() {
+                    let stack = elem.stack_ref_mut().unwrap();
+                    let idx = stack.surfaces().position(|s| &s == surface);
+                    idx.and_then(|idx| stack.remove_idx(idx))
+                } else {
+                    workspace.unmap(&elem);
+                    Some(elem.active_window())
+                }
+            } else {
+                None
+            };
+
+            if let Some(surface) = surface {
+                self.toplevel_info_state.remove_toplevel(&surface);
+                self.pending_windows.push((surface, seat.clone(), None));
+                return;
+            }
+        }
+    }
+
     pub fn element_under(
+        &mut self,
+        location: Point<f64, Global>,
+        output: &Output,
+    ) -> Option<KeyboardFocusTarget> {
+        self.workspaces.sets.get_mut(output).and_then(|set| {
+            set.sticky_layer
+                .space
+                .element_under(location.to_local(output).as_logical())
+                .map(|(mapped, _)| mapped.clone().into())
+                .or_else(|| set.workspaces[set.active].element_under(location))
+        })
+    }
+    pub fn surface_under(
         &mut self,
         location: Point<f64, Global>,
         output: &Output,
@@ -2065,10 +2089,9 @@ impl Shell {
         let overview = self.overview_mode.clone();
         self.workspaces.sets.get_mut(output).and_then(|set| {
             set.sticky_layer
-                .space
-                .element_under(location.to_local(output).as_logical())
-                .map(|(mapped, p)| (mapped.clone().into(), p.as_local().to_global(output)))
-                .or_else(|| set.workspaces[set.active].element_under(location, overview))
+                .surface_under(location.to_local(output))
+                .map(|(target, offset)| (target, offset.to_global(output)))
+                .or_else(|| set.workspaces[set.active].surface_under(location, overview))
         })
     }
 
@@ -2315,7 +2338,7 @@ impl Shell {
         if let Some(start_data) =
             check_grab_preconditions(&seat, surface, serial, ReleaseMode::NoMouseButtons)
         {
-            if let Some(mapped) = state.common.shell.element_for_wl_surface(surface).cloned() {
+            if let Some(mapped) = state.common.shell.element_for_surface(surface).cloned() {
                 let (_, relative_loc) = mapped
                     .windows()
                     .find(|(w, _)| w.wl_surface().as_ref() == Some(surface))
@@ -2434,9 +2457,7 @@ impl Shell {
         let output = seat.active_output();
 
         if let Some(mut start_data) = check_grab_preconditions(&seat, surface, serial, release) {
-            if let Some(mut old_mapped) =
-                state.common.shell.element_for_wl_surface(surface).cloned()
-            {
+            if let Some(mut old_mapped) = state.common.shell.element_for_surface(surface).cloned() {
                 if old_mapped.is_minimized() {
                     return;
                 }
@@ -2461,7 +2482,7 @@ impl Shell {
                         state.common.theme.clone(),
                     )
                     .into();
-                    start_data.focus = Some((new_mapped.clone().into(), Point::from((0, 0))));
+                    start_data.focus = new_mapped.focus_under((0., 0.).into());
                     new_mapped
                 } else {
                     old_mapped.clone()
@@ -2849,8 +2870,10 @@ impl Shell {
                 return;
             };
 
-            let focus = Some((mapped.clone().into(), (new_loc - geometry.loc).as_logical()));
-
+            let element_offset = (new_loc - geometry.loc).as_logical();
+            let focus = mapped
+                .focus_under(element_offset.to_f64())
+                .map(|(target, surface_offset)| (target, (surface_offset + element_offset)));
             start_data.location = new_loc.as_logical().to_f64();
             start_data.focus = focus.clone();
 
@@ -3063,7 +3086,7 @@ impl Shell {
         if let Some(start_data) =
             check_grab_preconditions(&seat, surface, serial, ReleaseMode::NoMouseButtons)
         {
-            if let Some(mapped) = state.common.shell.element_for_wl_surface(surface).cloned() {
+            if let Some(mapped) = state.common.shell.element_for_surface(surface).cloned() {
                 if mapped.is_fullscreen(true) || mapped.is_maximized(true) {
                     return;
                 }
